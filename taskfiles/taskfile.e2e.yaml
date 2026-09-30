@@ -6,10 +6,12 @@ tasks:
     requires:
       vars: [REPO, REF, DEST]
     dir: "{{ .WORKDIR | default .USER_WORKING_DIR }}"
+    preconditions:
+      - sh: 'case "{{ .DEST }}" in /*|.|./|..|../*|*/..|*/../*) exit 1;; esac'
+        msg: "DEST '{{ .DEST }}' must be a relative path inside WORKDIR"
+      - sh: '[ ! -e "{{ .DEST }}" ]'
+        msg: "DEST '{{ .DEST }}' already exists; remove it or pass SOURCE_DIR"
     cmds:
-      # Blobless rather than shallow: klio's e2e reaches goreleaser, which
-      # derives its version from tags, and REF may be a sha or a tag.
-      - rm -rf "{{ .DEST }}"
       - git clone --quiet --filter=blob:none --no-checkout "{{ .REPO }}" "{{ .DEST }}"
       - git -C "{{ .DEST }}" checkout --quiet "{{ .REF }}"
 
@@ -23,9 +25,6 @@ tasks:
         K8S_VERSION   Kubernetes version of the kind nodes, e.g. "v1.35.0".
                       Default: the tree's own default.
         NODES         Number of nodes. Default: the tree's own default (3).
-    # USE_EXISTING_ENV=true runs against the current kubeconfig context instead.
-    # Required vars are checked as preconditions, not `requires`: only
-    # preconditions are skipped along with the task when `if` is false.
     if: '{{ ne .USE_EXISTING_ENV "true" }}'
     dir: "{{ .WORKDIR | default .USER_WORKING_DIR }}"
     preconditions:
@@ -85,7 +84,7 @@ tasks:
           kubectl -n "$ns" logs "$pod" --all-containers --previous > "{{ .LOGS_DIR }}/$ns--$pod.prev.log" 2>&1 || true
         done
 
-  e2e:cnpg:run:
+  cnpg:e2e:
     desc: Run cloudnative-pg's e2e suite against a supplied operator image
     summary: |
       Deploys CONTROLLER_IMG from SOURCE_DIR's manifests and runs that tree's
@@ -169,7 +168,7 @@ tasks:
             LOGS_DIR: "{{ .LOGS_DIR }}"
       - cd {{ .SRC }} && ./hack/e2e/run-e2e.sh
 
-  e2e:klio:run:
+  klio:e2e:
     desc: Run klio's e2e suite against a supplied operator image
     summary: |
       Runs SOURCE_DIR's own `task integration:e2e` against OPERATOR_IMAGE.
@@ -203,14 +202,6 @@ tasks:
     preconditions:
       - sh: '[ -z "{{ .SOURCE_DIR }}" ] || [ -z "{{ .REF }}" ]'
         msg: "SOURCE_DIR and REF are mutually exclusive"
-      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || test -f "{{ .E2E_CONFIG_DIR }}/e2e-config.yaml.example"'
-        msg: "SOURCE_DIR '{{ .SOURCE_DIR }}' has no operator/test/e2e/e2e-config.yaml.example"
-      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || test -d "{{ .SOURCE_DIR }}/.git"'
-        msg: "SOURCE_DIR '{{ .SOURCE_DIR }}' has no .git; klio's e2e needs it for goreleaser"
-      - sh: 'echo "{{ .OPERATOR_IMAGE }}" | grep -qE ":[^:/]+$"'
-        msg: "OPERATOR_IMAGE '{{ .OPERATOR_IMAGE }}' must be <repository>:<tag>"
-      - sh: '[ -z "{{ .OPERAND_IMAGE }}" ] || echo "{{ .OPERAND_IMAGE }}" | grep -qE ":[^:/]+$"'
-        msg: "OPERAND_IMAGE '{{ .OPERAND_IMAGE }}' must be <repository>:<tag>"
     cmds:
       - task: git:clone
         if: "{{ not .SOURCE_DIR }}"
