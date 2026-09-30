@@ -1,6 +1,18 @@
 version: 3
 
 tasks:
+  git:clone:
+    internal: true
+    requires:
+      vars: [REPO, REF, DEST]
+    dir: "{{ .WORKDIR | default .USER_WORKING_DIR }}"
+    cmds:
+      # Blobless rather than shallow: klio's e2e reaches goreleaser, which
+      # derives its version from tags, and REF may be a sha or a tag.
+      - rm -rf "{{ .DEST }}"
+      - git clone --quiet --filter=blob:none --no-checkout "{{ .REPO }}" "{{ .DEST }}"
+      - git -C "{{ .DEST }}" checkout --quiet "{{ .REF }}"
+
   kind:create:
     desc: Create a kind cluster and a local registry via cloudnative-pg's setup-cluster.sh
     summary: |
@@ -81,8 +93,12 @@ tasks:
       image must be pullable from it.
 
       Configurable vars:
-        SOURCE_DIR                        Required. The cloudnative-pg tree the
-                                          image was built from.
+        SOURCE_DIR                        The cloudnative-pg tree the image was
+                                          built from. Default: a clone of REF.
+        REF                               Branch, tag or sha to clone when
+                                          SOURCE_DIR is empty. Mutually
+                                          exclusive with SOURCE_DIR.
+                                          Default: "main"
         CLUSTER_NAME                      Required. Name of the kind cluster.
         CONTROLLER_IMG                    Required. Operator image under test.
         LOGS_DIR                          Required. Where suite output,
@@ -102,10 +118,11 @@ tasks:
         E2E_CSI_STORAGE_CLASS             Default: "csi-hostpath-sc"
         E2E_DEFAULT_VOLUMESNAPSHOT_CLASS  Default: "csi-hostpath-snapclass"
     requires:
-      vars: [SOURCE_DIR, CLUSTER_NAME, CONTROLLER_IMG, LOGS_DIR]
+      vars: [CLUSTER_NAME, CONTROLLER_IMG, LOGS_DIR]
     dir: "{{ .WORKDIR | default .USER_WORKING_DIR }}"
     vars:
       TEST_UPGRADE_TO_V1: '{{ .TEST_UPGRADE_TO_V1 | default "false" }}'
+      SRC: '{{ .SOURCE_DIR | default (printf "_e2e_src/cloudnative-pg/%s" (.REF | default "main" | replace "/" "-")) }}'
     # What upstream's run-e2e-local.sh would export. CLUSTER_NAME and
     # CLUSTER_ENGINE are read under `set -u` with no default; the three storage
     # classes are what makes the suite configure a storage section at all.
@@ -122,26 +139,35 @@ tasks:
       POSTGRES_IMG: "{{ .POSTGRES_IMG }}"
       PGBOUNCER_IMG: "{{ .PGBOUNCER_IMG }}"
     preconditions:
-      - sh: 'test -x "{{ .SOURCE_DIR }}/hack/e2e/run-e2e.sh"'
+      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || [ -z "{{ .REF }}" ]'
+        msg: "SOURCE_DIR and REF are mutually exclusive"
+      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || test -x "{{ .SOURCE_DIR }}/hack/e2e/run-e2e.sh"'
         msg: "SOURCE_DIR '{{ .SOURCE_DIR }}' has no hack/e2e/run-e2e.sh"
     cmds:
+      - task: git:clone
+        if: "{{ not .SOURCE_DIR }}"
+        vars:
+          WORKDIR: "{{ .WORKDIR }}"
+          REPO: https://github.com/cloudnative-pg/cloudnative-pg.git
+          REF: '{{ .REF | default "main" }}'
+          DEST: "{{ .SRC }}"
       - task: cnpg:deploy
         vars:
           WORKDIR: "{{ .WORKDIR }}"
-          CNPG_DIR: "{{ .SOURCE_DIR }}"
+          CNPG_DIR: "{{ .SRC }}"
           CLUSTER_NAME: "{{ .CLUSTER_NAME }}"
           CONTROLLER_IMG: "{{ .CONTROLLER_IMG }}"
           TEST_UPGRADE_TO_V1: "{{ .TEST_UPGRADE_TO_V1 }}"
       - defer: |
           mkdir -p {{ .LOGS_DIR }}
-          [ -d {{ .SOURCE_DIR }}/tests/e2e/out ] && cp -a {{ .SOURCE_DIR }}/tests/e2e/out/. {{ .LOGS_DIR }}/ || true
+          [ -d {{ .SRC }}/tests/e2e/out ] && cp -a {{ .SRC }}/tests/e2e/out/. {{ .LOGS_DIR }}/ || true
           kubectl -n cnpg-system logs deploy/cnpg-controller-manager --tail=2000 > {{ .LOGS_DIR }}/operator.log 2>&1 || true
       - defer:
           task: diagnostics:dump
           vars:
             WORKDIR: "{{ .WORKDIR }}"
             LOGS_DIR: "{{ .LOGS_DIR }}"
-      - cd {{ .SOURCE_DIR }} && ./hack/e2e/run-e2e.sh
+      - cd {{ .SRC }} && ./hack/e2e/run-e2e.sh
 
   e2e:klio:run:
     desc: Run klio's e2e suite against a supplied operator image
@@ -152,7 +178,11 @@ tasks:
       caller's choice.
 
       Configurable vars:
-        SOURCE_DIR      Required. The klio tree the image was built from.
+        SOURCE_DIR      The klio tree the image was built from.
+                        Default: a clone of REF.
+        REF             Branch, tag or sha to clone when SOURCE_DIR is
+                        empty. Mutually exclusive with SOURCE_DIR.
+                        Default: "main"
         CLUSTER_NAME    Required. Name of the kind cluster.
         OPERATOR_IMAGE  Required. Operator image under test, as
                         <repository>:<tag>.
@@ -164,28 +194,38 @@ tasks:
         STORAGE_CLASS   Storage class for every PVC the specs create.
                         Default: "csi-hostpath-sc"
     requires:
-      vars: [SOURCE_DIR, CLUSTER_NAME, OPERATOR_IMAGE, LOGS_DIR]
+      vars: [CLUSTER_NAME, OPERATOR_IMAGE, LOGS_DIR]
     dir: "{{ .WORKDIR | default .USER_WORKING_DIR }}"
     vars:
-      E2E_CONFIG_DIR: "{{ .SOURCE_DIR }}/operator/test/e2e"
+      SRC: '{{ .SOURCE_DIR | default (printf "_e2e_src/klio/%s" (.REF | default "main" | replace "/" "-")) }}'
+      E2E_CONFIG_DIR: "{{ .SRC }}/operator/test/e2e"
       STORAGE_CLASS: '{{ .STORAGE_CLASS | default "csi-hostpath-sc" }}'
     preconditions:
-      - sh: 'test -f "{{ .E2E_CONFIG_DIR }}/e2e-config.yaml.example"'
+      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || [ -z "{{ .REF }}" ]'
+        msg: "SOURCE_DIR and REF are mutually exclusive"
+      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || test -f "{{ .E2E_CONFIG_DIR }}/e2e-config.yaml.example"'
         msg: "SOURCE_DIR '{{ .SOURCE_DIR }}' has no operator/test/e2e/e2e-config.yaml.example"
-      - sh: 'test -d "{{ .SOURCE_DIR }}/.git"'
+      - sh: '[ -z "{{ .SOURCE_DIR }}" ] || test -d "{{ .SOURCE_DIR }}/.git"'
         msg: "SOURCE_DIR '{{ .SOURCE_DIR }}' has no .git; klio's e2e needs it for goreleaser"
       - sh: 'echo "{{ .OPERATOR_IMAGE }}" | grep -qE ":[^:/]+$"'
         msg: "OPERATOR_IMAGE '{{ .OPERATOR_IMAGE }}' must be <repository>:<tag>"
       - sh: '[ -z "{{ .OPERAND_IMAGE }}" ] || echo "{{ .OPERAND_IMAGE }}" | grep -qE ":[^:/]+$"'
         msg: "OPERAND_IMAGE '{{ .OPERAND_IMAGE }}' must be <repository>:<tag>"
     cmds:
+      - task: git:clone
+        if: "{{ not .SOURCE_DIR }}"
+        vars:
+          WORKDIR: "{{ .WORKDIR }}"
+          REPO: https://github.com/cloudnative-pg/klio.git
+          REF: '{{ .REF | default "main" }}'
+          DEST: "{{ .SRC }}"
       - >
         sed -e 's|^storageClass: .*|storageClass: "{{ .STORAGE_CLASS }}"|'
         {{ if .OPERAND_IMAGE }}-e 's|^serverImage: .*|serverImage: "{{ .OPERAND_IMAGE }}"|'{{ end }}
         {{ .E2E_CONFIG_DIR }}/e2e-config.yaml.example > {{ .E2E_CONFIG_DIR }}/e2e-config.yaml
       - defer: |
           mkdir -p {{ .LOGS_DIR }}
-          [ -d {{ .SOURCE_DIR }}/e2e_cluster_logs ] && cp -a {{ .SOURCE_DIR }}/e2e_cluster_logs/. {{ .LOGS_DIR }}/ || true
+          [ -d {{ .SRC }}/e2e_cluster_logs ] && cp -a {{ .SRC }}/e2e_cluster_logs/. {{ .LOGS_DIR }}/ || true
           kubectl -n cnpg-system logs deploy/klio-controller-manager --tail=2000 > {{ .LOGS_DIR }}/klio-operator.log 2>&1 || true
       - defer:
           task: diagnostics:dump
@@ -193,7 +233,7 @@ tasks:
             WORKDIR: "{{ .WORKDIR }}"
             LOGS_DIR: "{{ .LOGS_DIR }}"
       - >
-        task -t {{ .SOURCE_DIR }}/Taskfile.yml -d {{ .SOURCE_DIR }} integration:e2e
+        task -t {{ .SRC }}/Taskfile.yml -d {{ .SRC }} integration:e2e
         KIND_CLUSTER_NAME={{ .CLUSTER_NAME }}
         OPERATOR_IMAGE_REPOSITORY={{ regexReplaceAll ":[^:/]+$" .OPERATOR_IMAGE "" }}
         OPERATOR_IMAGE_TAG={{ regexReplaceAll "^.*:" .OPERATOR_IMAGE "" }}
